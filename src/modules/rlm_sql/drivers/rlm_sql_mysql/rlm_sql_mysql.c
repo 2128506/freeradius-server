@@ -45,6 +45,17 @@ RCSID("$Id$")
 #  include <mysqld_error.h>
 #endif
 
+#if (MYSQL_VERSION_ID >= 50555) && (MYSQL_VERSION_ID < 50600)
+#define HAVE_TLS_OPTIONS        1
+#elif (MYSQL_VERSION_ID >= 50636) && (MYSQL_VERSION_ID < 50700)
+#define HAVE_TLS_OPTIONS        1
+#define HAVE_CRL_OPTIONS        1
+#elif MYSQL_VERSION_ID >= 50700
+#define HAVE_TLS_OPTIONS        1
+#define HAVE_CRL_OPTIONS        1
+#define HAVE_TLS_VERIFY_OPTIONS 1
+#endif
+
 #include "rlm_sql.h"
 
 static int mysql_instance_count = 0;
@@ -97,10 +108,10 @@ static CONF_PARSER tls_config[] = {
 	{ "certificate_file", FR_CONF_OFFSET(PW_TYPE_FILE_INPUT, rlm_sql_mysql_config_t, tls_certificate_file), NULL },
 	{ "private_key_file", FR_CONF_OFFSET(PW_TYPE_FILE_INPUT, rlm_sql_mysql_config_t, tls_private_key_file), NULL },
 
-#if defined(MYSQL_OPT_SSL_CRL) && defined(MYSQL_OPT_SSL_CRLPATH)
+//#if defined(MYSQL_OPT_SSL_CRL) && defined(MYSQL_OPT_SSL_CRLPATH)
 	{ "crl_file", FR_CONF_OFFSET(PW_TYPE_FILE_INPUT, rlm_sql_mysql_config_t, tls_crl_file), NULL },
 	{ "crl_path", FR_CONF_OFFSET(PW_TYPE_FILE_INPUT, rlm_sql_mysql_config_t, tls_crl_path), NULL },
-#endif
+//#endif
 	/*
 	 *	MySQL Specific TLS attributes
 	 */
@@ -114,13 +125,11 @@ static CONF_PARSER tls_config[] = {
 	 *	but for consistency we break them out anyway, and warn if the user
 	 *	has provided an invalid list of flags.
 	 */
-#ifdef MYSQL_OPT_SSL_MODE
-	{ "tls_required", FR_CONF_OFFSET(PW_TYPE_BOOL, rlm_sql_mysql_config_t, tls_required), NULL },
-#  ifdef SSL_MODE_VERIFY_CA
-	{ "check_cert", FR_CONF_OFFSET(PW_TYPE_BOOL, rlm_sql_mysql_config_t, tls_check_cert), NULL },
-#  endif
-#  ifdef SSL_MODE_VERIFY_IDENTITY
-	{ "check_cert_cn", FR_CONF_OFFSET(PW_TYPE_BOOL, rlm_sql_mysql_config_t, tls_check_cert_cn), NULL },
+#if HAVE_TLS_OPTIONS
+	{ "tls_required", FR_CONF_OFFSET(PW_TYPE_BOOLEAN, rlm_sql_mysql_config_t, tls_required), "no" },
+#  if HAVE_TLS_VERIFY_OPTIONS
+	{ "check_cert", FR_CONF_OFFSET(PW_TYPE_BOOLEAN, rlm_sql_mysql_config_t, tls_check_cert), "no" },
+	{ "check_cert_cn", FR_CONF_OFFSET(PW_TYPE_BOOLEAN, rlm_sql_mysql_config_t, tls_check_cert_cn), "no" },
 #  endif
 #endif
 	CONF_PARSER_TERMINATOR
@@ -151,22 +160,20 @@ static int _mod_destructor(UNUSED rlm_sql_mysql_config_t *driver)
 {
 	if (--mysql_instance_count == 0) mysql_library_end();
 
-#ifdef SSL_MODE_VERIFY_CA
-	if (inst->tls_check_cert && !inst->tls_required) {
+#if HAVE_TLS_VERIFY_OPTIONS
+	if (driver->tls_check_cert && !driver->tls_required) {
 		WARN("Implicitly setting tls_required = yes, as tls_check_cert = yes");
-		inst->tls_required = true;
+		driver->tls_required = true;
 	}
-#endif
-#ifdef SSL_MODE_VERIFY_IDENTITY
-	if (inst->tls_check_cert_cn) {
-		if (!inst->tls_required) {
+	if (driver->tls_check_cert_cn) {
+		if (!driver->tls_required) {
 			WARN("Implicitly setting tls_required = yes, as check_cert_cn = yes");
-			inst->tls_required = true;
+			driver->tls_required = true;
 		}
 
-		if (!inst->tls_check_cert) {
+		if (!driver->tls_check_cert) {
 			WARN("Implicitly setting check_cert = yes, as check_cert_cn = yes");
-			inst->tls_check_cert = true;
+			driver->tls_check_cert = true;
 		}
 	}
 #endif
@@ -237,23 +244,21 @@ static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *c
 			      driver->tls_ca_file, driver->tls_ca_path, driver->tls_cipher);
 	}
 
-#ifdef MYSQL_OPT_SSL_MODE
+#if HAVE_TLS_OPTIONS
 	{
 		unsigned int	ssl_mode = 0;
 		bool		ssl_mode_isset = false;
 
-		if (inst->tls_required) {
-			ssl_mode = MYSQL_OPT_SSL_MODE;
+		if (driver->tls_required) {
+			ssl_mode = SSL_MODE_REQUIRED;
 			ssl_mode_isset = true;
 		}
-#  ifdef SSL_MODE_VERIFY_CA
-		if (inst->tls_check_cert) {
+#  if HAVE_TLS_VERIFY_OPTIONS
+		if (driver->tls_check_cert) {
 			ssl_mode = SSL_MODE_VERIFY_CA;
 			ssl_mode_isset = true;
 		}
-#  endif
-#  ifdef SSL_MODE_VERIFY_IDENTITY
-		if (inst->tls_check_cert_cn) {
+		if (driver->tls_check_cert_cn) {
 			ssl_mode = SSL_MODE_VERIFY_IDENTITY;
 			ssl_mode_isset = true;
 		}
@@ -262,9 +267,9 @@ static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *c
 	}
 #endif
 
-#if defined(MYSQL_OPT_SSL_CRL) && defined(MYSQL_OPT_SSL_CRLPATH)
-	if (inst->crl_file) mysql_options(&(conn->db), MYSQL_OPT_SSL_CRL, inst->crl_file);
-	if (inst->crl_path) mysql_options(&(conn->db), MYSQL_OPT_SSL_CRL_PATH, inst->crl_path);
+#if HAVE_CRL_OPTIONS
+	if (driver->tls_crl_file) mysql_options(&(conn->db), MYSQL_OPT_SSL_CRL, driver->tls_crl_file);
+	if (driver->tls_crl_path) mysql_options(&(conn->db), MYSQL_OPT_SSL_CRLPATH, driver->tls_crl_path);
 #endif
 
 	mysql_options(&(conn->db), MYSQL_READ_DEFAULT_GROUP, "freeradius");
@@ -273,7 +278,7 @@ static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *c
 	 *	We need to know about connection errors, and are capable
 	 *	of reconnecting automatically.
 	 */
-#ifdef MYSQL_OPT_RECONNECT
+#if MYSQL_VERSION_ID >= 50013
 	{
 		my_bool reconnect = 0;
 		mysql_options(&(conn->db), MYSQL_OPT_RECONNECT, &reconnect);
