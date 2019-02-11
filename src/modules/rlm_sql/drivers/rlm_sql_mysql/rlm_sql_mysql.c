@@ -69,14 +69,24 @@ typedef struct rlm_sql_mysql_conn {
 } rlm_sql_mysql_conn_t;
 
 typedef struct rlm_sql_mysql_config {
-	char const *tls_ca_file;		//!< Path to the CA used to validate the server's certificate.
-	char const *tls_ca_path;		//!< Directory containing CAs that may be used to validate the
+	char const	*tls_ca_file;		//!< Path to the CA used to validate the server's certificate.
+	char const	*tls_ca_path;		//!< Directory containing CAs that may be used to validate the
 						//!< servers certificate.
-	char const *tls_certificate_file;	//!< Public certificate we present to the server.
-	char const *tls_private_key_file;	//!< Private key for the certificate we present to the server.
-	char const *tls_cipher;
+	char const	*tls_certificate_file;	//!< Public certificate we present to the server.
+	char const	*tls_private_key_file;	//!< Private key for the certificate we present to the server.
 
-	char const *warnings_str;		//!< Whether we always query the server for additional warnings.
+	char const	*tls_crl_file;		//!< Public certificate we present to the server.
+	char const	*tls_crl_path;		//!< Private key for the certificate we present to the server.
+
+	char const	*tls_cipher;		//!< Colon separated list of TLS ciphers for TLS <= 1.2.
+
+	bool		tls_required;		//!< Require that the connection is encrypted.
+	bool		tls_check_cert;		//!< Verify there's a trust relationship between the server's
+						///< cert and one of the CAs we have configured.
+	bool		tls_check_cert_cn;	//!< Verify that the CN in the server cert matches the host
+						///< we passed to mysql_real_connect().
+
+	char const	*warnings_str;		//!< Whether we always query the server for additional warnings.
 	rlm_sql_mysql_warnings	warnings;	//!< mysql_warning_count() doesn't
 						//!< appear to work with NDB cluster
 } rlm_sql_mysql_config_t;
@@ -87,10 +97,32 @@ static CONF_PARSER tls_config[] = {
 	{ "certificate_file", FR_CONF_OFFSET(PW_TYPE_FILE_INPUT, rlm_sql_mysql_config_t, tls_certificate_file), NULL },
 	{ "private_key_file", FR_CONF_OFFSET(PW_TYPE_FILE_INPUT, rlm_sql_mysql_config_t, tls_private_key_file), NULL },
 
+#if defined(MYSQL_OPT_SSL_CRL) && defined(MYSQL_OPT_SSL_CRLPATH)
+	{ "crl_file", FR_CONF_OFFSET(PW_TYPE_FILE_INPUT, rlm_sql_mysql_config_t, tls_crl_file), NULL },
+	{ "crl_path", FR_CONF_OFFSET(PW_TYPE_FILE_INPUT, rlm_sql_mysql_config_t, tls_crl_path), NULL },
+#endif
 	/*
 	 *	MySQL Specific TLS attributes
 	 */
 	{ "cipher", FR_CONF_OFFSET(PW_TYPE_STRING, rlm_sql_mysql_config_t, tls_cipher), NULL },
+
+	/*
+	 *	The closest thing we have to these options in other modules is
+	 *	in rlm_rest.  rlm_ldap has its own bizarre option set.
+	 *
+	 *	There, the options can be toggled independently, here they can't
+	 *	but for consistency we break them out anyway, and warn if the user
+	 *	has provided an invalid list of flags.
+	 */
+#ifdef MYSQL_OPT_SSL_MODE
+	{ "tls_required", FR_CONF_OFFSET(PW_TYPE_BOOL, rlm_sql_mysql_config_t, tls_required), NULL },
+#  ifdef SSL_MODE_VERIFY_CA
+	{ "check_cert", FR_CONF_OFFSET(PW_TYPE_BOOL, rlm_sql_mysql_config_t, tls_check_cert), NULL },
+#  endif
+#  ifdef SSL_MODE_VERIFY_IDENTITY
+	{ "check_cert_cn", FR_CONF_OFFSET(PW_TYPE_BOOL, rlm_sql_mysql_config_t, tls_check_cert_cn), NULL },
+#  endif
+#endif
 	CONF_PARSER_TERMINATOR
 };
 
@@ -119,6 +151,25 @@ static int _mod_destructor(UNUSED rlm_sql_mysql_config_t *driver)
 {
 	if (--mysql_instance_count == 0) mysql_library_end();
 
+#ifdef SSL_MODE_VERIFY_CA
+	if (inst->tls_check_cert && !inst->tls_required) {
+		WARN("Implicitly setting tls_required = yes, as tls_check_cert = yes");
+		inst->tls_required = true;
+	}
+#endif
+#ifdef SSL_MODE_VERIFY_IDENTITY
+	if (inst->tls_check_cert_cn) {
+		if (!inst->tls_required) {
+			WARN("Implicitly setting tls_required = yes, as check_cert_cn = yes");
+			inst->tls_required = true;
+		}
+
+		if (!inst->tls_check_cert) {
+			WARN("Implicitly setting check_cert = yes, as check_cert_cn = yes");
+			inst->tls_check_cert = true;
+		}
+	}
+#endif
 	return 0;
 }
 
@@ -185,6 +236,36 @@ static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *c
 		mysql_ssl_set(&(conn->db), driver->tls_private_key_file, driver->tls_certificate_file,
 			      driver->tls_ca_file, driver->tls_ca_path, driver->tls_cipher);
 	}
+
+#ifdef MYSQL_OPT_SSL_MODE
+	{
+		unsigned int	ssl_mode = 0;
+		bool		ssl_mode_isset = false;
+
+		if (inst->tls_required) {
+			ssl_mode = MYSQL_OPT_SSL_MODE;
+			ssl_mode_isset = true;
+		}
+#  ifdef SSL_MODE_VERIFY_CA
+		if (inst->tls_check_cert) {
+			ssl_mode = SSL_MODE_VERIFY_CA;
+			ssl_mode_isset = true;
+		}
+#  endif
+#  ifdef SSL_MODE_VERIFY_IDENTITY
+		if (inst->tls_check_cert_cn) {
+			ssl_mode = SSL_MODE_VERIFY_IDENTITY;
+			ssl_mode_isset = true;
+		}
+#  endif
+		if (ssl_mode_isset) mysql_options(&(conn->db), MYSQL_OPT_SSL_MODE, &ssl_mode);
+	}
+#endif
+
+#if defined(MYSQL_OPT_SSL_CRL) && defined(MYSQL_OPT_SSL_CRLPATH)
+	if (inst->crl_file) mysql_options(&(conn->db), MYSQL_OPT_SSL_CRL, inst->crl_file);
+	if (inst->crl_path) mysql_options(&(conn->db), MYSQL_OPT_SSL_CRL_PATH, inst->crl_path);
+#endif
 
 	mysql_options(&(conn->db), MYSQL_READ_DEFAULT_GROUP, "freeradius");
 
